@@ -33,10 +33,7 @@ if w3 is None:
 # عناوين العقود
 WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 USDT = "0x55d398326f99059fF775485246999027B3197955"
-
-# عنواني الروترين (V2 و V3) لمقارنة الأسعار بينهما
 PANCAKE_ROUTER_V2 = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-PANCAKE_ROUTER_V3 = "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4"
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -47,8 +44,8 @@ def send_telegram(text):
     except:
         pass
 
-def get_price_from_router(router_address, retries=2):
-    """يجلب السعر من أي روتير (V2 أو V3)"""
+def get_current_price(retries=2):
+    """يجلب السعر الحالي من PancakeSwap V2"""
     for attempt in range(retries):
         try:
             abi = [{
@@ -61,7 +58,7 @@ def get_price_from_router(router_address, retries=2):
                 "stateMutability": "view",
                 "type": "function"
             }]
-            router = w3.eth.contract(address=router_address, abi=abi)
+            router = w3.eth.contract(address=PANCAKE_ROUTER_V2, abi=abi)
             amount_in = 10**18
             path = [WBNB, USDT]
             amounts = router.functions.getAmountsOut(amount_in, path).call()
@@ -70,62 +67,103 @@ def get_price_from_router(router_address, retries=2):
             time.sleep(1)
     return None
 
-def scan_cycle(cycle_number):
+# ======== المتغيرات العامة لتخزين الأسعار السابقة (لحساب المتوسطات) ========
+price_history = []
+
+def generate_signal(current_price, price_history):
+    """
+    توليد إشارة تداول بناءً على تقاطع المتوسطات المتحركة البسيطة (SMA)
+    SMA5 و SMA10
+    """
+    if len(price_history) < 10:
+        return "انتظار", None, None, None, None  # بيانات غير كافية
+    
+    # حساب SMA5 و SMA10
+    sma5 = sum(price_history[-5:]) / 5
+    sma10 = sum(price_history[-10:]) / 10
+    
+    # تحديد الإشارة
+    if sma5 > sma10 * 1.002:  # شرط شراء مع زيادة 0.2% لتجنب الإشارات الخاطئة
+        signal = "شراء"
+        entry_price = current_price
+        stop_loss = entry_price * 0.98  # وقف خسارة 2% تحت سعر الدخول
+        take_profit = entry_price * 1.04  # جني أرباح 4% فوق سعر الدخول
+        reason = f"SMA5 ({sma5:.2f}) > SMA10 ({sma10:.2f}) بفارق {(sma5/sma10-1)*100:.2f}%"
+    elif sma5 < sma10 * 0.998:  # شرط بيع
+        signal = "بيع"
+        entry_price = current_price
+        stop_loss = entry_price * 1.02  # وقف خسارة 2% فوق سعر الدخول (للبيع)
+        take_profit = entry_price * 0.96  # جني أرباح 4% تحت سعر الدخول (للبيع)
+        reason = f"SMA5 ({sma5:.2f}) < SMA10 ({sma10:.2f}) بفارق {(1 - sma5/sma10)*100:.2f}%"
+    else:
+        signal = "لا تتداول"
+        entry_price = None
+        stop_loss = None
+        take_profit = None
+        reason = f"SMA5 ({sma5:.2f}) قريب من SMA10 ({sma10:.2f})، الفرق ضئيل"
+    
+    return signal, entry_price, stop_loss, take_profit, reason
+
+def scan_cycle(cycle_number, price_history):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    current_price = get_current_price()
     
-    price_v2 = get_price_from_router(PANCAKE_ROUTER_V2)
-    price_v3 = get_price_from_router(PANCAKE_ROUTER_V3)
-    
-    # إذا فشل المصدران
-    if price_v2 is None and price_v3 is None:
-        msg = f"⚠️ جولة #{cycle_number} الساعة {now}\nفشل جلب الأسعار من جميع المجمعات."
+    if current_price is None:
+        msg = f"⚠️ جولة #{cycle_number} الساعة {now}\nفشل جلب السعر الحالي."
         send_telegram(msg)
-        return
+        return price_history
     
-    # إذا نجح مصدر واحد فقط
-    if price_v2 is None:
-        msg = f"⚠️ جولة #{cycle_number} الساعة {now}\nسعر V2 غير متاح، نعرض V3 فقط.\n🟣 سعر V3: {price_v3:.4f} USDT"
-        send_telegram(msg)
-        return
-    if price_v3 is None:
-        msg = f"⚠️ جولة #{cycle_number} الساعة {now}\nسعر V3 غير متاح، نعرض V2 فقط.\n🟢 سعر V2: {price_v2:.4f} USDT"
-        send_telegram(msg)
-        return
+    # إضافة السعر الجديد للتاريخ
+    price_history.append(current_price)
+    if len(price_history) > 20:
+        price_history.pop(0)  # الاحتفاظ بآخر 20 سعر فقط
     
-    # الحالة الطبيعية (المصدران موجودان)
-    diff = abs(price_v2 - price_v3)
-    percent = (diff / price_v3) * 100
+    # توليد الإشارة
+    signal, entry, sl, tp, reason = generate_signal(current_price, price_history)
     
-    if percent >= 0.3:  # عدّل إلى 2.0 للأرباح الحقيقية
+    # بناء الرسالة
+    if signal == "شراء":
         msg = (
-            f"🔥🔥🔥 فرصة أرباح كبيرة بين V2 و V3! 🔥🔥🔥\n"
+            f"🟢 **إشارة شراء قوية** 🟢\n"
             f"📅 الوقت: {now}\n"
-            f"🟢 V2: {price_v2:.4f} USDT\n"
-            f"🟣 V3: {price_v3:.4f} USDT\n"
-            f"📈 نسبة الربح المتوقعة: {percent:.2f}%\n"
-            f"💰 استعد للتنفيذ فوراً!"
+            f"💰 سعر الدخول المقترح: {entry:.4f} USDT\n"
+            f"🛑 وقف الخسارة: {sl:.4f} USDT (خسارة 2%)\n"
+            f"🎯 جني الأرباح: {tp:.4f} USDT (ربح 4%)\n"
+            f"📊 السبب: {reason}\n"
+            f"⚠️ نصيحة: ضع أمر شراء معلق عند {entry:.4f}، وأوقف الخسارة عند {sl:.4f}."
+        )
+    elif signal == "بيع":
+        msg = (
+            f"🔴 **إشارة بيع قوية** 🔴\n"
+            f"📅 الوقت: {now}\n"
+            f"💰 سعر الدخول المقترح: {entry:.4f} USDT\n"
+            f"🛑 وقف الخسارة: {sl:.4f} USDT (خسارة 2%)\n"
+            f"🎯 جني الأرباح: {tp:.4f} USDT (ربح 4%)\n"
+            f"📊 السبب: {reason}\n"
+            f"⚠️ نصيحة: ضع أمر بيع معلق عند {entry:.4f}، وأوقف الخسارة عند {sl:.4f}."
         )
     else:
         msg = (
-            f"🔄 جولة مراقبة #{cycle_number}\n"
-            f"🕒 الوقت: {now}\n"
-            f"V2: {price_v2:.4f} USDT\n"
-            f"V3: {price_v3:.4f} USDT\n"
-            f"📉 الفرق الحالي: {percent:.2f}%\n"
-            f"❌ لا توجد فرصة ربح مجدية الآن."
+            f"⏸️ **لا توجد إشارة تداول حالياً**\n"
+            f"📅 الوقت: {now}\n"
+            f"💰 السعر الحالي: {current_price:.4f} USDT\n"
+            f"📊 السبب: {reason}\n"
+            f"💡 انتظر حتى يتكون اتجاه واضح."
         )
     
     send_telegram(msg)
     print(msg)
+    return price_history
 
 # ======== التشغيل الرئيسي ========
 if __name__ == "__main__":
-    print("=== Shadow Sniffer V3 (مقارنة V2 vs V3) ===")
-    send_telegram("🚀 تم تفعيل النسخة V3 - مقارنة مجمعين لا مركزيين...")
+    print("=== Shadow Sniffer - نظام التداول الذكي (SMA Crossover) ===")
+    send_telegram("🚀 تم تفعيل نظام التداول الذكي (متوسطات متحركة)...")
     
+    price_history = []
     for i in range(1, 6):
-        scan_cycle(i)
+        price_history = scan_cycle(i, price_history)
         if i < 5:
             time.sleep(30)
     
-    send_telegram("⏸️ انتهت دورة المسح. سأعود بعد 10 دقائق.")
+    send_telegram("⏸️ انتهت دورة التحليل. سأعود بعد 10 دقائق.")
